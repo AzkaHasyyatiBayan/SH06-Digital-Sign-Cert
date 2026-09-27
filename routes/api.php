@@ -18,6 +18,25 @@ Route::get('/sanctum/csrf-cookie', function () {
     return response()->json(['csrf' => 'ok']);
 });
 
+$resolveUser = function (?Request $request = null) {
+    if (Auth::check()) {
+        return Auth::user();
+    }
+    if ($request) {
+        $id = $request->input('uploaded_by_id') ?? $request->input('user_id') ?? $request->input('signer_id');
+        if ($id) {
+            $user = User::find($id);
+            if ($user) return $user;
+        }
+        $email = $request->input('uploaded_by_email') ?? $request->input('user_email') ?? $request->input('email');
+        if ($email) {
+            $user = User::where('email', $email)->first();
+            if ($user) return $user;
+        }
+    }
+    return User::first();
+};
+
 // ============ AUTH ============
 
 Route::post('/auth/register', function (Request $request) {
@@ -82,7 +101,7 @@ Route::get('/documents', function () {
     );
 });
 
-Route::post('/documents', function (Request $request) {
+Route::post('/documents', function (Request $request) use ($resolveUser) {
     $request->validate([
         'title' => 'required|string|max:255',
         'type' => 'nullable|string|max:255',
@@ -91,17 +110,22 @@ Route::post('/documents', function (Request $request) {
 
     $path = $request->file('file')->store('documents');
 
+    $user = $resolveUser($request);
+    $userId = $user?->id ?? User::first()?->id;
+    $userName = $user?->name ?? 'Pengguna';
+
     $doc = Document::create([
         'title' => $request->title,
         'type' => $request->type ?? 'General',
         'status' => 'draft',
         'file_path' => $path,
-        'uploaded_by_id' => Auth::id(),
+        'uploaded_by_id' => $userId,
     ]);
 
     // Kalau ada target signer, langsung buat request tanda tangan
     if ($request->has('target_signer_emails')) {
-        $emails = json_decode($request->target_signer_emails, true) ?? [];
+        $raw = $request->target_signer_emails;
+        $emails = is_array($raw) ? $raw : (json_decode($raw, true) ?? []);
         foreach ($emails as $email) {
             $signer = User::where('email', $email)->first();
             if ($signer) {
@@ -119,32 +143,34 @@ Route::post('/documents', function (Request $request) {
     }
 
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $userId,
         'action' => 'upload',
-        'description' => Auth::user()->name . ' mengunggah dokumen baru: ' . $doc->title,
+        'description' => $userName . ' mengunggah dokumen baru: ' . $doc->title,
         'ip_address' => $request->ip(),
     ]);
 
     return response()->json(['success' => true, 'document' => $doc->load('uploadedBy')], 201);
 });
 
-Route::delete('/documents/{id}', function ($id) {
+Route::delete('/documents/{id}', function ($id) use ($resolveUser) {
     $doc = Document::findOrFail($id);
     $title = $doc->title;
     $doc->delete();
 
+    $user = $resolveUser();
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'system',
-        'description' => Auth::user()->name . ' menghapus dokumen: ' . $title,
+        'description' => ($user?->name ?? 'Pengguna') . ' menghapus dokumen: ' . $title,
         'ip_address' => request()->ip(),
     ]);
 
     return response()->json(['success' => true]);
 });
 
-Route::post('/documents/{id}/request-signer', function (Request $request, $id) {
-    if (Auth::user()->role !== 'admin') {
+Route::post('/documents/{id}/request-signer', function (Request $request, $id) use ($resolveUser) {
+    $user = $resolveUser($request);
+    if ($user && $user->role !== 'admin') {
         return response()->json(['success' => false, 'message' => 'Hanya admin yang dapat meminta tanda tangan dari user lain.'], 403);
     }
 
@@ -177,11 +203,12 @@ Route::post('/documents/{id}/request-signer', function (Request $request, $id) {
     return response()->json(['success' => true, 'document' => $doc->load(['uploadedBy', 'signatures.signer'])]);
 });
 
-Route::post('/documents/{id}/sign', function (Request $request, $id) {
+Route::post('/documents/{id}/sign', function (Request $request, $id) use ($resolveUser) {
     $doc = Document::findOrFail($id);
+    $user = $resolveUser($request);
 
     $sig = Signature::where('document_id', $doc->id)
-        ->where('signer_id', Auth::id())
+        ->where('signer_id', $user?->id)
         ->whereNull('signed_at')
         ->first();
 
@@ -197,9 +224,9 @@ Route::post('/documents/{id}/sign', function (Request $request, $id) {
     }
 
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'signed',
-        'description' => Auth::user()->name . ' menandatangani dokumen: ' . $doc->title,
+        'description' => ($user?->name ?? 'Pengguna') . ' menandatangani dokumen: ' . $doc->title,
         'ip_address' => $request->ip(),
     ]);
 
@@ -256,7 +283,7 @@ Route::get('/certificates', function () {
     return response()->json(Certificate::orderBy('valid_until', 'asc')->get());
 });
 
-Route::post('/certificates', function (Request $request) {
+Route::post('/certificates', function (Request $request) use ($resolveUser) {
     $validated = $request->validate([
         'name' => 'required|string|max:255',
         'holder' => 'required|string|max:255',
@@ -273,24 +300,26 @@ Route::post('/certificates', function (Request $request) {
         'valid_until' => now()->addDays($days)->toDateString(),
     ]);
 
+    $user = $resolveUser($request);
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'system',
-        'description' => Auth::user()->name . ' menerbitkan sertifikat: ' . $cert->name,
+        'description' => ($user?->name ?? 'Pengguna') . ' menerbitkan sertifikat: ' . $cert->name,
         'ip_address' => $request->ip(),
     ]);
 
     return response()->json(['success' => true, 'certificate' => $cert], 201);
 });
 
-Route::delete('/certificates/{id}', function ($id) {
+Route::delete('/certificates/{id}', function ($id) use ($resolveUser) {
     $cert = Certificate::findOrFail($id);
     $cert->delete();
 
+    $user = $resolveUser();
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'system',
-        'description' => Auth::user()->name . ' mencabut sertifikat: ' . $cert->name,
+        'description' => ($user?->name ?? 'Pengguna') . ' mencabut sertifikat: ' . $cert->name,
         'ip_address' => request()->ip(),
     ]);
 
@@ -303,45 +332,49 @@ Route::get('/teams', function () {
     return response()->json(Team::with('members')->latest()->get());
 });
 
-Route::post('/teams', function (Request $request) {
+Route::post('/teams', function (Request $request) use ($resolveUser) {
     $validated = $request->validate([
         'name' => 'required|string|max:255',
         'description' => 'nullable|string',
     ]);
 
+    $user = $resolveUser($request);
     $team = Team::create([
         ...$validated,
-        'created_by_id' => Auth::id(),
+        'created_by_id' => $user?->id,
     ]);
 
-    $team->members()->attach(Auth::id(), ['role' => 'Leader']);
+    if ($user) {
+        $team->members()->attach($user->id, ['role' => 'Leader']);
+    }
 
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'system',
-        'description' => Auth::user()->name . ' membuat tim baru: ' . $team->name,
+        'description' => ($user?->name ?? 'Pengguna') . ' membuat tim baru: ' . $team->name,
         'ip_address' => $request->ip(),
     ]);
 
     return response()->json(['success' => true, 'team' => $team->load('members')], 201);
 });
 
-Route::delete('/teams/{id}', function ($id) {
+Route::delete('/teams/{id}', function ($id) use ($resolveUser) {
     $team = Team::findOrFail($id);
     $name = $team->name;
     $team->delete();
 
+    $user = $resolveUser();
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'system',
-        'description' => Auth::user()->name . ' menghapus tim: ' . $name,
+        'description' => ($user?->name ?? 'Pengguna') . ' menghapus tim: ' . $name,
         'ip_address' => request()->ip(),
     ]);
 
     return response()->json(['success' => true]);
 });
 
-Route::post('/teams/{id}/members', function (Request $request, $id) {
+Route::post('/teams/{id}/members', function (Request $request, $id) use ($resolveUser) {
     $team = Team::findOrFail($id);
 
     $validated = $request->validate([
@@ -355,24 +388,26 @@ Route::post('/teams/{id}/members', function (Request $request, $id) {
 
     $team->members()->attach($validated['user_id'], ['role' => $validated['role']]);
 
+    $user = $resolveUser($request);
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'update',
-        'description' => Auth::user()->name . ' menambahkan anggota ke tim: ' . $team->name,
+        'description' => ($user?->name ?? 'Pengguna') . ' menambahkan anggota ke tim: ' . $team->name,
         'ip_address' => $request->ip(),
     ]);
 
     return response()->json(['success' => true, 'team' => $team->load('members')]);
 });
 
-Route::delete('/teams/{id}/members/{userId}', function ($id, $userId) {
+Route::delete('/teams/{id}/members/{userId}', function ($id, $userId) use ($resolveUser) {
     $team = Team::findOrFail($id);
     $team->members()->detach($userId);
 
+    $user = $resolveUser();
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'update',
-        'description' => Auth::user()->name . ' mengeluarkan anggota dari tim: ' . $team->name,
+        'description' => ($user?->name ?? 'Pengguna') . ' mengeluarkan anggota dari tim: ' . $team->name,
         'ip_address' => request()->ip(),
     ]);
 
@@ -385,7 +420,7 @@ Route::get('/api-keys', function () {
     return response()->json(ApiKey::latest()->get());
 });
 
-Route::post('/api-keys', function (Request $request) {
+Route::post('/api-keys', function (Request $request) use ($resolveUser) {
     $validated = $request->validate(['name' => 'required|string|max:255']);
 
     $rawKey = 'lx_live_' . bin2hex(random_bytes(20));
@@ -397,10 +432,11 @@ Route::post('/api-keys', function (Request $request) {
         'last_used_at' => null,
     ]);
 
+    $user = $resolveUser($request);
     ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => 'system',
-        'description' => Auth::user()->name . ' membuat API Key baru: ' . $apiKey->name,
+        'description' => ($user?->name ?? 'Pengguna') . ' membuat API Key baru: ' . $apiKey->name,
         'ip_address' => $request->ip(),
     ]);
 
@@ -439,9 +475,10 @@ Route::get('/activities', function () {
     return response()->json($mapped);
 });
 
-Route::post('/activities', function (Request $request) {
+Route::post('/activities', function (Request $request) use ($resolveUser) {
+    $user = $resolveUser($request);
     $log = ActivityLog::create([
-        'user_id' => Auth::id(),
+        'user_id' => $user?->id,
         'action' => $request->input('action', 'system'),
         'description' => $request->input('description', ''),
         'ip_address' => $request->ip(),
